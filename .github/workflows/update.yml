@@ -1,0 +1,50 @@
+name: Update bin-clean.ics
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily at ~06:00 UTC
+  workflow_dispatch: {}     # allow manual runs from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-ics
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run scraper
+        env:
+          WFB_EMAIL: ${{ secrets.WFB_EMAIL }}
+          WFB_PASSWORD: ${{ secrets.WFB_PASSWORD }}
+        run: python scraper.py
+
+      - name: Sanity-check output
+        run: |
+          test -s bin-clean.ics
+          grep -q "BEGIN:VEVENT" bin-clean.ics
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet -- bin-clean.ics && \
+             ! git status --porcelain bin-clean.ics | grep -q .; then
+            echo "bin-clean.ics unchanged; nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bin-clean.ics
+          git commit -m "Update bin-clean.ics"
+          git push
