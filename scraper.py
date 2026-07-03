@@ -134,8 +134,19 @@ def extract_dates(html, today):
     return sorted(unique)
 
 
+def _bin_name(cell):
+    """Friendly bin name from a bincell's colour class, e.g. 'blackbin' ->
+    'Black', 'bluebin' -> 'Blue'. None if no colour class is present."""
+    for cls in (cell.get("class") or []):
+        low = cls.lower()
+        if low.endswith("bin") and low != "bincell" and len(low) > 3:
+            return low[:-3].capitalize()
+    return None
+
+
 def parse_schedule_dates(html, today):
-    """Extract the booking's clean dates from the /home/schedule fragment.
+    """Extract the booking's clean dates (with bin types) from the
+    /home/schedule fragment. Returns {date: [bin names]}.
 
     The fragment is a Bootstrap grid (not an HTML table). Each week is a row
     of cells:
@@ -143,21 +154,27 @@ def parse_schedule_dates(html, today):
       - `bincell`   -> an actual clean, e.g. "bincell blackbin" / "bincell
                        bluebin"; text like "Friday, 03 Jul"
       - plain `schedcell` -> "No Clean"
-    So the real clean dates are exactly the `bincell` cells; taking those
-    avoids both the phantom weekly Mondays and the "No Clean" slots."""
+    So the real clean dates are exactly the `bincell` cells. A single date
+    can carry more than one bin (e.g. blue and green cleaned the same day),
+    so we collect the set of bins per date."""
     soup = BeautifulSoup(html, "html.parser")
 
-    dates = []
+    schedule = {}
     for cell in soup.find_all(class_="bincell"):
         d = parse_date_str(cell.get_text(" ", strip=True), today)
-        if d:
-            dates.append(d)
-    if dates:
-        return sorted(set(dates))
+        if not d:
+            continue
+        bins = schedule.setdefault(d, set())
+        name = _bin_name(cell)
+        if name:
+            bins.add(name)
+    if schedule:
+        return {d: sorted(b) for d, b in schedule.items()}
 
     # Fallback for a possible <table> layout (e.g. a future/print variant):
-    # skip the first "W/C" column and read dates from the rest.
-    return _parse_schedule_table(soup, today)
+    # skip the first "W/C" column and read dates from the rest. Bin types
+    # aren't distinguishable there, so leave them empty.
+    return {d: [] for d in _parse_schedule_table(soup, today)}
 
 
 def _parse_schedule_table(soup, today):
@@ -461,8 +478,8 @@ def dump_schedule_debug(label, body, today, secrets):
 
 
 def fetch_schedule(session, booking_id, today, debug=False, secrets=()):
-    """Try the /home/schedule endpoint variants in order and return the
-    first list of dates that parses. The exact method/encoding used by the
+    """Try the /home/schedule endpoint variants in order and return the first
+    {date: [bins]} map that parses. The exact method/encoding used by the
     site's modal plugin is unverified, hence the small candidate set."""
     candidates = []
     for prefix in ("", "/api"):
@@ -505,13 +522,13 @@ def fetch_schedule(session, booking_id, today, debug=False, secrets=()):
 
         if debug:
             dump_schedule_debug(label, body, today, secrets)
-        dates = parse_schedule_dates(body, today)
-        if dates:
-            print(f"schedule {label}: parsed {len(dates)} date(s)")
-            return dates
+        schedule = parse_schedule_dates(body, today)
+        if schedule:
+            print(f"schedule {label}: parsed {len(schedule)} date(s)")
+            return schedule
         print(f"schedule {label}: 200 but no dates found")
 
-    return []
+    return {}
 
 
 # --------------------------------------------------------------------------
@@ -523,7 +540,17 @@ def ics_escape(text):
                 .replace(",", "\\,").replace("\n", "\\n"))
 
 
-def build_ics(dates, booking_id):
+def summarise_bins(bins):
+    """Event title for a clean. Names the bin(s) when known, e.g.
+    'Black bin clean (Wheelie Fresh Bins)' or
+    'Blue & Green bin clean (Wheelie Fresh Bins)'; falls back to the generic
+    SUMMARY when the bin type isn't available."""
+    if not bins:
+        return SUMMARY
+    return f"{' & '.join(bins)} bin clean (Wheelie Fresh Bins)"
+
+
+def build_ics(schedule, booking_id):
     slug = uid_slug(booking_id)
     lines = [
         "BEGIN:VCALENDAR",
@@ -533,7 +560,9 @@ def build_ics(dates, booking_id):
         "METHOD:PUBLISH",
         "X-WR-CALNAME:Bin cleans",
     ]
-    for d in dates:
+    for d in sorted(schedule):
+        bins = schedule[d]
+        summary = summarise_bins(bins)
         ymd = d.strftime("%Y%m%d")
         next_day = (d + timedelta(days=1)).strftime("%Y%m%d")
         lines.extend([
@@ -544,11 +573,15 @@ def build_ics(dates, booking_id):
             f"DTSTAMP:{ymd}T000000Z",
             f"DTSTART;VALUE=DATE:{ymd}",
             f"DTEND;VALUE=DATE:{next_day}",
-            f"SUMMARY:{ics_escape(SUMMARY)}",
+            f"SUMMARY:{ics_escape(summary)}",
+        ])
+        if bins:
+            lines.append(f"DESCRIPTION:{ics_escape('Bins: ' + ', '.join(bins))}")
+        lines.extend([
             "TRANSP:TRANSPARENT",
             "BEGIN:VALARM",
             "ACTION:DISPLAY",
-            f"DESCRIPTION:{ics_escape(SUMMARY)}",
+            f"DESCRIPTION:{ics_escape(summary)}",
             "TRIGGER:-PT12H",
             "END:VALARM",
             "END:VEVENT",
@@ -586,17 +619,17 @@ def main():
     debug = bool(os.environ.get("WFB_DEBUG"))
     # Address is only collected to redact it from any debug output.
     secrets = [email, get_address(page)]
-    dates = fetch_schedule(session, booking_id, today, debug=debug, secrets=secrets)
+    schedule = fetch_schedule(session, booking_id, today, debug=debug, secrets=secrets)
     source = "schedule endpoint"
-    if not dates:
+    if not schedule:
         print("schedule endpoint unusable; falling back to Next Clean column")
-        dates = parse_next_cleans(page, today)
+        schedule = {d: [] for d in parse_next_cleans(page, today)}
         source = "Next Clean column"
-    if not dates:
+    if not schedule:
         fail("no clean dates found from either the schedule endpoint or "
              "the bookings table")
 
-    bad = [d for d in dates
+    bad = [d for d in schedule
            if d < today - PAST_SLACK or d > today + FUTURE_SLACK]
     if bad:
         fail(f"parsed implausible dates {bad} (from {source}); "
@@ -605,9 +638,9 @@ def main():
     holidays = parse_holidays(page, today)
     if holidays:
         print(f"holiday ranges: {holidays}")
-    kept = [d for d in dates
-            if not any(start <= d <= end for start, end in holidays)]
-    skipped = len(dates) - len(kept)
+    kept = {d: b for d, b in schedule.items()
+            if not any(start <= d <= end for start, end in holidays)}
+    skipped = len(schedule) - len(kept)
     if skipped:
         print(f"excluded {skipped} clean(s) falling within bin holidays")
     if not kept:
@@ -616,7 +649,7 @@ def main():
 
     # Only future-facing events matter for the feed, but keep the last few
     # weeks so a clean earlier this week doesn't vanish from the calendar.
-    kept = [d for d in kept if d >= today - timedelta(days=21)]
+    kept = {d: b for d, b in kept.items() if d >= today - timedelta(days=21)}
     if not kept:
         fail("no current or future clean dates after filtering")
 
@@ -624,7 +657,8 @@ def main():
     with open(ICS_PATH, "w", newline="") as f:
         f.write(ics)
     print(f"wrote {ICS_PATH}: {len(kept)} event(s) from {source}: "
-          + ", ".join(d.isoformat() for d in kept))
+          + ", ".join(f"{d.isoformat()}[{'/'.join(b) or '?'}]"
+                      for d, b in sorted(kept.items())))
 
 
 if __name__ == "__main__":
