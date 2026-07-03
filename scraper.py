@@ -138,83 +138,23 @@ def extract_dates(html, today):
 # Portal client
 # --------------------------------------------------------------------------
 
-def _pick_form_html(payload, raw_text):
-    """Given the parsed JSON payload (or None) and the raw response text,
-    return the string most likely to contain the login form markup."""
-    if isinstance(payload, dict):
-        # The form markup may sit directly under a key or one level down
-        # (e.g. {"data": {"html": "..."}}). Search a couple of common shapes.
-        for key in ("html", "Html", "form", "Form", "view", "View",
-                    "partial", "content", "body"):
-            val = payload.get(key)
-            if isinstance(val, str) and "<" in val:
-                return val
-        for container in ("data", "Data", "result", "Result", "model", "Model"):
-            inner = payload.get(container)
-            if isinstance(inner, dict):
-                for key in ("html", "Html", "form", "Form", "view", "View"):
-                    val = inner.get(key)
-                    if isinstance(val, str) and "<" in val:
-                        return val
-            elif isinstance(inner, str) and "<" in inner:
-                return inner
-    return raw_text
+def prime_session(session):
+    """Hit the site root to collect cookies and return any anti-forgery
+    token found in the cookie jar.
 
-
-def get_login_form(session):
-    """GET /Account/Ajax_Login and return (form_html, antiforgery_token).
-
-    First hits the site root so any anti-forgery / session cookie the login
-    partial depends on is present."""
-    # Prime cookies: some ASP.NET anti-forgery setups only render the login
-    # form's hidden token once a session cookie exists.
+    The portal is a JavaScript SPA: unauthenticated routes (including the
+    old /Account/Ajax_Login partial, which now 302s to a NotFound page)
+    just return the marketing homepage, so there is no server-rendered login
+    form to read field names from. All we need here is the cookie jar."""
     try:
         session.get(f"{BASE_URL}/", timeout=30)
     except requests.RequestException as e:
         print(f"warning: priming GET / failed: {e}")
 
-    r = session.get(f"{BASE_URL}/Account/Ajax_Login",
-                    headers={"X-Requested-With": "XMLHttpRequest",
-                             "Accept": "application/json, text/html"},
-                    timeout=30)
-    r.raise_for_status()
-
-    payload = None
-    try:
-        payload = r.json()
-    except ValueError:
-        pass  # server returned the form as plain HTML
-
-    html = _pick_form_html(payload, r.text)
-
-    soup = BeautifulSoup(html, "html.parser")
-    n_inputs = len(soup.find_all("input"))
-    if n_inputs == 0:
-        # Diagnostics (no credentials are sent on this GET; the login form
-        # is public). Print the response shape so a re-run reveals the real
-        # structure, then let discovery fail loudly.
-        ctype = r.headers.get("Content-Type", "?")
-        shape = (f"keys={sorted(payload.keys())}"
-                 if isinstance(payload, dict) else f"type={type(payload).__name__}")
-        print(f"login form GET: HTTP {r.status_code}, content-type {ctype}, "
-              f"{len(r.text)} bytes, json {shape}")
-        print("response preview: "
-              + redact(r.text[:800], []).replace("\n", " "))
-
-    token_input = soup.find("input", attrs={"name": "__RequestVerificationToken"})
-    token = token_input.get("value") if token_input else None
-    if not token:
-        # The token may also arrive as a cookie or a JSON field.
-        for k, v in session.cookies.items():
-            if "RequestVerification" in k or "AntiForgery" in k:
-                token = v
-                break
-    if not token and isinstance(payload, dict):
-        for key in ("token", "Token", "antiForgeryToken", "__RequestVerificationToken"):
-            if isinstance(payload.get(key), str):
-                token = payload[key]
-                break
-    return html, token
+    for k, v in session.cookies.items():
+        if "RequestVerification" in k or "AntiForgery" in k:
+            return v
+    return None
 
 
 # Input types that can never be the username box.
@@ -273,34 +213,28 @@ def discover_credential_fields(form_html):
     return user_field, password_field, fields
 
 
-def build_token_body(email, password, form_html, token):
+def build_token_body(email, password, token):
     """Build the POST /Token form body.
 
-    The portal is a JS SPA: unauthenticated routes return the marketing
-    homepage, so the login form is never server-rendered for us to read
-    field names from. The /Token endpoint is an OWIN OAuth token endpoint,
-    which reads the spec-standard lowercase keys `username` and `password`
-    from the form body (via context.UserName / context.Password) regardless
-    of what the on-screen form labels its boxes. We send those, plus a few
-    harmless aliases in case this particular endpoint expects MVC-style
-    names. Extra params are ignored by a conformant token endpoint, so this
-    stays a single login attempt rather than a probing loop."""
+    /Token is an OWIN OAuth token endpoint. With grant_type=password the
+    middleware reads the spec-standard lowercase keys `username`/`password`
+    (into context.UserName / context.Password) regardless of what the
+    on-screen SPA labels its boxes. We send those plus a few harmless
+    aliases (email / MVC-style names) in case the provider reads the form
+    directly. A conformant token endpoint ignores unknown params, so this
+    stays a single login attempt rather than a probing loop.
+
+    Confirmed live: this shape is accepted (a wrong password yields a clean
+    `invalid_grant` "The user name or password is incorrect." rather than an
+    `invalid_request`/`unsupported_grant_type` error)."""
     body = {
         "grant_type": "password",
         "username": email,
         "password": password,
     }
-
-    # If the form actually was readable (it isn't, currently), honour its
-    # real field names too.
-    user_field, password_field, _ = discover_credential_fields(form_html)
-    if user_field:
-        body[user_field] = email
-    if password_field:
-        body[password_field] = password
-
-    # Common ASP.NET MVC aliases, in case the endpoint is custom.
-    for alias in ("UserName", "Email"):
+    # Aliases in case the provider reads the raw form for a differently
+    # named identifier field.
+    for alias in ("email", "Email", "UserName"):
         body.setdefault(alias, email)
     body.setdefault("Password", password)
 
@@ -314,9 +248,9 @@ def login(session, email, password):
 
     Best-effort: collect cookies and any anti-forgery token first (harmless
     if absent), then make a single POST /Token."""
-    form_html, token = get_login_form(session)
+    token = prime_session(session)
 
-    body = build_token_body(email, password, form_html, token)
+    body = build_token_body(email, password, token)
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "X-Requested-With": "XMLHttpRequest",
