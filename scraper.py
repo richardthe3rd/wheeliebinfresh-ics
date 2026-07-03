@@ -134,6 +134,52 @@ def extract_dates(html, today):
     return sorted(unique)
 
 
+def parse_schedule_dates(html, today):
+    """Extract the booking's clean dates from the /home/schedule fragment.
+
+    The fragment is a table: the first column is "W/C" (week commencing) —
+    a Monday label for each week, NOT a clean date — and the remaining
+    "Bin Cleans" columns hold the actual clean dates (or "No Clean"). We must
+    skip the W/C column, otherwise every weekly Monday is wrongly treated as
+    a clean (that produced 16 phantom Monday events alongside the 8 real
+    Friday cleans). Verified against the portal's printable schedule."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    target = None
+    wc_col = 0
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+        header = [c.get_text(" ", strip=True).lower()
+                  for c in rows[0].find_all(["th", "td"])]
+        if any("bin clean" in h for h in header) or \
+                any(h in ("w/c", "wc", "week commencing") for h in header):
+            target = table
+            for i, h in enumerate(header):
+                if "w/c" in h or h.startswith("week"):
+                    wc_col = i
+                    break
+            break
+
+    if target is None:
+        # Unexpected layout: no recognisable schedule table. Rather than grab
+        # every date (which over-collects), signal "nothing parsed" so the
+        # caller falls back to the Next Clean column.
+        return []
+
+    dates = []
+    for row in target.find_all("tr")[1:]:
+        cells = row.find_all(["td", "th"])
+        for i, cell in enumerate(cells):
+            if i == wc_col:
+                continue  # week-commencing label, not a clean date
+            d = parse_date_str(cell.get_text(" ", strip=True), today)
+            if d:
+                dates.append(d)
+    return sorted(set(dates))
+
+
 # --------------------------------------------------------------------------
 # Portal client
 # --------------------------------------------------------------------------
@@ -320,6 +366,21 @@ def parse_next_cleans(page_html, today):
     return sorted(set(dates))
 
 
+def get_address(page_html):
+    """Return the account address from #tblBookings (used only to redact it
+    from debug output). Best-effort; empty string if not found."""
+    soup = BeautifulSoup(page_html, "html.parser")
+    table = soup.find(id="tblBookings")
+    if not table:
+        return ""
+    col = find_table_column(table, "Address")
+    rows = table.find_all("tr")
+    if col is None or len(rows) < 2:
+        return ""
+    cells = rows[1].find_all("td")
+    return cells[col].get_text(" ", strip=True) if len(cells) > col else ""
+
+
 def parse_holidays(page_html, today):
     """Return a list of (first_day, last_day) ranges from #tblHolidays."""
     soup = BeautifulSoup(page_html, "html.parser")
@@ -347,7 +408,36 @@ def parse_holidays(page_html, today):
     return ranges
 
 
-def fetch_schedule(session, booking_id, today):
+def dump_schedule_debug(label, body, today, secrets):
+    """Print the structure of a schedule fragment so its real layout can be
+    understood without shipping guessed dates. Redacts the account address
+    and email. Only runs when WFB_DEBUG is set (manual dispatch)."""
+    print(f"\n----- DEBUG schedule fragment [{label}] ({len(body)} bytes) -----")
+    soup = BeautifulSoup(body, "html.parser")
+    tables = soup.find_all("table")
+    print(f"tables: {len(tables)}")
+    for ti, table in enumerate(tables):
+        tid = table.get("id") or table.get("class") or "(no id)"
+        rows = table.find_all("tr")
+        header = [c.get_text(" ", strip=True)
+                  for c in (rows[0].find_all(["th", "td"]) if rows else [])]
+        print(f"  table[{ti}] id={tid} rows={len(rows)} header={header}")
+        for r in rows[1:4]:
+            cells = [c.get_text(" ", strip=True) for c in r.find_all(["td", "th"])]
+            print("    row:", redact(" | ".join(cells), secrets))
+    # Each date with its immediate row/li context, to see which column/list
+    # the real clean dates live in.
+    print("dates in context:")
+    for el in soup.find_all(["td", "li"]):
+        d = parse_date_str(el.get_text(" ", strip=True), today)
+        if d:
+            parent = el.find_parent(["tr", "ul", "ol"])
+            ctx = parent.get_text(" | ", strip=True) if parent else el.get_text(strip=True)
+            print(f"    {d}: {redact(ctx[:160], secrets)}")
+    print("----- END DEBUG -----\n")
+
+
+def fetch_schedule(session, booking_id, today, debug=False, secrets=()):
     """Try the /home/schedule endpoint variants in order and return the
     first list of dates that parses. The exact method/encoding used by the
     site's modal plugin is unverified, hence the small candidate set."""
@@ -390,8 +480,10 @@ def fetch_schedule(session, booking_id, today):
         except ValueError:
             pass  # HTML fragment, as expected
 
-        dates = extract_dates(body, today)
+        dates = parse_schedule_dates(body, today)
         if dates:
+            if debug:
+                dump_schedule_debug(label, body, today, secrets)
             print(f"schedule {label}: parsed {len(dates)} date(s)")
             return dates
         print(f"schedule {label}: 200 but no dates found")
@@ -465,7 +557,10 @@ def main():
              "page layout may have changed")
     print(f"bookingId: {booking_id}")
 
-    dates = fetch_schedule(session, booking_id, today)
+    debug = bool(os.environ.get("WFB_DEBUG"))
+    # Address is only collected to redact it from any debug output.
+    secrets = [email, get_address(page)]
+    dates = fetch_schedule(session, booking_id, today, debug=debug, secrets=secrets)
     source = "schedule endpoint"
     if not dates:
         print("schedule endpoint unusable; falling back to Next Clean column")

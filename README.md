@@ -1,67 +1,83 @@
 # Wheelie Fresh Bins → calendar feed
 
 A daily GitHub Actions job logs into the [Wheelie Fresh Bins customer
-portal](https://portal.wheeliefreshbins.com/), reads the bin cleaning
-schedule, and commits it to this repo as `bin-clean.ics`. Calendar apps
-subscribe to the raw file URL and stay up to date automatically.
+portal](https://portal.wheeliefreshbins.com/), reads your bin cleaning
+schedule, and **publishes it to GitHub Pages** as `bin-clean.ics`. Calendar
+apps subscribe to that public URL and stay up to date automatically. The
+file is regenerated and redeployed each day — it is never committed into
+the repo.
 
-No address or personal details are written into the calendar file — just
-all-day "Bin clean" events with a reminder the evening before. Bin
-Holidays recorded on the portal are excluded automatically.
+The calendar contains only all-day "Bin clean" events (with a reminder the
+evening before) — **no address or personal details**. Ad-hoc extra cleans
+are included; Bin Holidays recorded on the portal are excluded.
+
+## Publishing model: GitHub Pages, not raw files
+
+The schedule is served at:
+
+```
+https://<user>.github.io/<repo>/bin-clean.ics
+```
+
+for this repo that is `https://richardthe3rd.github.io/wheeliebinfresh-ics/bin-clean.ics`.
+
+Why Pages and not the raw file in the repo? A calendar app needs a URL it
+can fetch **without logging in**. A private repo's `raw.githubusercontent.com`
+URL requires a token, so calendar apps can't use it. GitHub Pages gives a
+clean public URL.
+
+> **The repo must be public** for Pages on a free GitHub plan (private-repo
+> Pages needs a paid plan). The ICS holds only dates, no address, so making
+> the repo public is safe. If you'd rather keep it private, you need GitHub
+> Pro/Team, otherwise the feed can't be subscribed to.
 
 ## One-time setup (all doable from a phone)
 
 ### 1. Add the portal credentials as secrets
 
-1. Open this repo on github.com → **Settings** (on mobile web, tap the
-   **⋯** / kebab menu if Settings isn't visible) → **Secrets and
-   variables** → **Actions**.
-2. Tap **New repository secret** and add:
-   - Name `WFB_EMAIL`, value: the email you log into the portal with.
-   - Name `WFB_PASSWORD`, value: your portal password.
+Repo → **Settings** → **Secrets and variables** → **Actions** →
+**New repository secret**, twice:
 
-### 2. Enable and test the workflow
+- `WFB_EMAIL` — the email you log into the portal with.
+- `WFB_PASSWORD` — your portal password.
 
-1. Go to the **Actions** tab. If prompted, tap **I understand my
-   workflows, enable them**.
-2. Open the **Update bin-clean.ics** workflow → **Run workflow** to do a
-   first manual run.
-3. When it goes green, `bin-clean.ics` appears in the repo. If it goes
-   red, open the run log — the scraper prints why (bad credentials,
-   portal layout change, etc.) and GitHub emails you about the failure.
+### 2. Turn on GitHub Pages (source: GitHub Actions)
+
+Repo → **Settings** → **Pages** → under **Build and deployment**, set
+**Source** to **GitHub Actions**. (No branch to pick — the workflow deploys
+the file directly.)
+
+### 3. Run the workflow once
+
+**Actions** tab → **Publish bin-clean.ics to Pages** → **Run workflow**.
+When it goes green, open the run's **deploy** step (or Settings → Pages) to
+get your `…github.io/…/bin-clean.ics` URL. If it goes red, the log says why
+(bad credentials, portal/layout change) and GitHub emails you.
 
 It then runs by itself every day at about 06:00 UTC.
-
-### 3. Get the raw URL
-
-Open `bin-clean.ics` in the repo and copy the **Raw** link. It looks like:
-
-```
-https://raw.githubusercontent.com/<user>/<repo>/main/bin-clean.ics
-```
-
-(Swap `main` for the default branch if yours differs. If the repo is
-private, raw URLs need auth and calendar apps can't subscribe — make the
-repo public, or use a private gist instead. The ICS contains only dates,
-no address.)
 
 ### 4. Subscribe in your calendar
 
 **Google Calendar** (must be done on the web, not the app):
 
-1. Open [calendar.google.com](https://calendar.google.com) in a browser —
-   on a phone, request the desktop site if needed.
-2. **Settings** (gear) → **Add calendar** → **From URL**.
-3. Paste the raw URL → **Add calendar**.
-4. It appears under "Other calendars" and syncs to the phone app. Google
-   refreshes subscribed calendars on its own schedule (every several
-   hours up to ~a day).
+1. [calendar.google.com](https://calendar.google.com) → **Settings** (gear)
+   → **Add calendar** → **From URL**.
+2. Paste the Pages URL → **Add calendar**. It syncs to the phone app;
+   Google refreshes subscribed calendars every several hours up to ~a day.
 
 **Apple Calendar (iPhone/iPad):**
 
 1. **Settings** → **Apps** → **Calendar** → **Calendar Accounts** →
    **Add Account** → **Other** → **Add Subscribed Calendar**.
-2. Paste the raw URL and tap **Next** → **Save**.
+2. Paste the Pages URL → **Next** → **Save**.
+
+## Note on the default branch
+
+This repo currently has no `main` branch — the default branch is the one
+the workflow lives on. Scheduled workflows run from the **default branch**,
+so whatever branch is set as default in Settings → Branches is the one that
+publishes daily. That's fine as-is; if you later rename/replace the default
+branch, keep `.github/workflows/update.yml` on it.
 
 ## Running locally
 
@@ -69,21 +85,24 @@ no address.)
 pip install requests beautifulsoup4
 export WFB_EMAIL='you@example.com'
 export WFB_PASSWORD='...'
-python scraper.py
+python scraper.py            # writes ./bin-clean.ics
+# WFB_DEBUG=1 python scraper.py   # also prints the schedule table structure
 ```
-
-Writes `bin-clean.ics` in the current directory.
 
 ## How it works / maintenance notes
 
-- `scraper.py` logs in once per run (form → `POST /Token` → bearer
-  token), reads the account page for the booking id, bookings table and
-  holiday table, then asks the portal's schedule endpoint for upcoming
-  clean dates. If that endpoint can't be read it falls back to the
-  "Next Clean" column on the account page.
-- Events get stable UIDs (`wfb-<bookingId>-<date>@binclean`), so re-runs
-  update rather than duplicate, and the file is only committed when the
-  schedule actually changes.
-- The scraper refuses to write the file if it finds no dates or
-  implausible dates, so a portal change breaks the workflow loudly
-  instead of silently emptying your calendar.
+- `scraper.py` logs in by replicating the portal's own login form
+  submission: it fetches the `_Login` partial (which carries an
+  anti-forgery token and an anti-bot honeypot with a per-session key),
+  fills in the credentials, and POSTs the whole form to `/Token` for a
+  bearer token. Then it reads the account page for the booking id and
+  fetches `/home/schedule`.
+- The schedule table's first column is the week-commencing label (a Monday)
+  and is **not** a clean date; only the "Bin Cleans" columns are. The
+  scraper skips the W/C column and de-duplicates, so you get exactly the
+  real Friday cleans (regular + ad-hoc).
+- Events use stable UIDs (`wfb-<bookingId>-<date>@binclean`), so re-runs
+  update rather than duplicate.
+- The scraper refuses to write the file on missing/implausible dates, and
+  the workflow refuses to deploy an empty file — a portal change fails the
+  run loudly instead of publishing a broken calendar.

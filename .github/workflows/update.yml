@@ -1,20 +1,33 @@
-name: Update bin-clean.ics
+name: Publish bin-clean.ics to Pages
 
 on:
   schedule:
     - cron: "0 6 * * *"   # daily at ~06:00 UTC
-  workflow_dispatch: {}     # allow manual runs from the Actions tab
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "Dump the schedule fragment structure (address-redacted) for debugging"
+        type: boolean
+        default: false
 
+# Scheduled runs use the default branch's copy of this workflow.
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
+# Let a run finish deploying before the next starts; don't cancel a
+# half-finished deploy.
 concurrency:
-  group: update-ics
+  group: pages
   cancel-in-progress: false
 
 jobs:
-  update:
+  build-and-deploy:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +42,7 @@ jobs:
         env:
           WFB_EMAIL: ${{ secrets.WFB_EMAIL }}
           WFB_PASSWORD: ${{ secrets.WFB_PASSWORD }}
+          WFB_DEBUG: ${{ inputs.debug && '1' || '' }}
         run: python scraper.py
 
       - name: Sanity-check output
@@ -36,15 +50,24 @@ jobs:
           test -s bin-clean.ics
           grep -q "BEGIN:VEVENT" bin-clean.ics
 
-      - name: Commit if changed
+      - name: Assemble Pages site
         run: |
-          if git diff --quiet -- bin-clean.ics && \
-             ! git status --porcelain bin-clean.ics | grep -q .; then
-            echo "bin-clean.ics unchanged; nothing to commit"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add bin-clean.ics
-          git commit -m "Update bin-clean.ics"
-          git push
+          mkdir -p _site
+          cp bin-clean.ics _site/bin-clean.ics
+          cat > _site/index.html <<'EOF'
+          <!doctype html>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Bin clean calendar</title>
+          <h1>Bin clean calendar</h1>
+          <p>Subscribe to <a href="bin-clean.ics">bin-clean.ics</a> in your calendar app.</p>
+          EOF
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
