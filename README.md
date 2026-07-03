@@ -101,10 +101,12 @@ python scraper.py            # writes ./bin-clean.ics
   fills in the credentials, and POSTs the whole form to `/Token` for a
   bearer token. Then it reads the account page for the booking id and
   fetches `/home/schedule`.
-- The schedule table's first column is the week-commencing label (a Monday)
-  and is **not** a clean date; only the "Bin Cleans" columns are. The
-  scraper skips the W/C column and de-duplicates, so you get exactly the
-  real Friday cleans (regular + ad-hoc).
+- The `/home/schedule` fragment is a grid of `<div>`s (not a table). Each
+  week row has a `weekcell` (the week-commencing Monday label — not a
+  clean), `No Clean` cells, and `bincell` cells that are the actual cleans
+  (e.g. `bincell blackbin`). The scraper reads the `bincell` cells and
+  de-duplicates, so you get exactly the real cleans across all bins
+  (regular black-bin plus any ad-hoc blue/green ones).
 - Events use stable UIDs (`wfb-<hash>-<date>@binclean`, where `<hash>` is a
   one-way hash of the booking id — the raw number never appears in the
   published file), so re-runs update rather than duplicate.
