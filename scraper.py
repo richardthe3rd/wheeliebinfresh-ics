@@ -137,14 +137,30 @@ def extract_dates(html, today):
 def parse_schedule_dates(html, today):
     """Extract the booking's clean dates from the /home/schedule fragment.
 
-    The fragment is a table: the first column is "W/C" (week commencing) —
-    a Monday label for each week, NOT a clean date — and the remaining
-    "Bin Cleans" columns hold the actual clean dates (or "No Clean"). We must
-    skip the W/C column, otherwise every weekly Monday is wrongly treated as
-    a clean (that produced 16 phantom Monday events alongside the 8 real
-    Friday cleans). Verified against the portal's printable schedule."""
+    The fragment is a Bootstrap grid (not an HTML table). Each week is a row
+    of cells:
+      - `weekcell`  -> the "W/C" week-commencing label (a Monday, NOT a clean)
+      - `bincell`   -> an actual clean, e.g. "bincell blackbin" / "bincell
+                       bluebin"; text like "Friday, 03 Jul"
+      - plain `schedcell` -> "No Clean"
+    So the real clean dates are exactly the `bincell` cells; taking those
+    avoids both the phantom weekly Mondays and the "No Clean" slots."""
     soup = BeautifulSoup(html, "html.parser")
 
+    dates = []
+    for cell in soup.find_all(class_="bincell"):
+        d = parse_date_str(cell.get_text(" ", strip=True), today)
+        if d:
+            dates.append(d)
+    if dates:
+        return sorted(set(dates))
+
+    # Fallback for a possible <table> layout (e.g. a future/print variant):
+    # skip the first "W/C" column and read dates from the rest.
+    return _parse_schedule_table(soup, today)
+
+
+def _parse_schedule_table(soup, today):
     target = None
     wc_col = 0
     for table in soup.find_all("table"):
@@ -163,9 +179,6 @@ def parse_schedule_dates(html, today):
             break
 
     if target is None:
-        # Unexpected layout: no recognisable schedule table. Rather than grab
-        # every date (which over-collects), signal "nothing parsed" so the
-        # caller falls back to the Next Clean column.
         return []
 
     dates = []
