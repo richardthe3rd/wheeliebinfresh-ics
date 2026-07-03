@@ -420,6 +420,9 @@ def dump_schedule_debug(label, body, today, secrets):
     understood without shipping guessed dates. Redacts the account address
     and email. Only runs when WFB_DEBUG is set (manual dispatch)."""
     print(f"\n----- DEBUG schedule fragment [{label}] ({len(body)} bytes) -----")
+    # Raw excerpt (redacted) so the true markup is visible even if it isn't a
+    # table (e.g. a list or divs).
+    print("raw excerpt: " + redact(body[:2000], secrets).replace("\n", " "))
     soup = BeautifulSoup(body, "html.parser")
     tables = soup.find_all("table")
     print(f"tables: {len(tables)}")
@@ -487,10 +490,10 @@ def fetch_schedule(session, booking_id, today, debug=False, secrets=()):
         except ValueError:
             pass  # HTML fragment, as expected
 
+        if debug:
+            dump_schedule_debug(label, body, today, secrets)
         dates = parse_schedule_dates(body, today)
         if dates:
-            if debug:
-                dump_schedule_debug(label, body, today, secrets)
             print(f"schedule {label}: parsed {len(dates)} date(s)")
             return dates
         print(f"schedule {label}: 200 but no dates found")
