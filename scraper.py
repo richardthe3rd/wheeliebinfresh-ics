@@ -138,25 +138,82 @@ def extract_dates(html, today):
 # Portal client
 # --------------------------------------------------------------------------
 
+def _pick_form_html(payload, raw_text):
+    """Given the parsed JSON payload (or None) and the raw response text,
+    return the string most likely to contain the login form markup."""
+    if isinstance(payload, dict):
+        # The form markup may sit directly under a key or one level down
+        # (e.g. {"data": {"html": "..."}}). Search a couple of common shapes.
+        for key in ("html", "Html", "form", "Form", "view", "View",
+                    "partial", "content", "body"):
+            val = payload.get(key)
+            if isinstance(val, str) and "<" in val:
+                return val
+        for container in ("data", "Data", "result", "Result", "model", "Model"):
+            inner = payload.get(container)
+            if isinstance(inner, dict):
+                for key in ("html", "Html", "form", "Form", "view", "View"):
+                    val = inner.get(key)
+                    if isinstance(val, str) and "<" in val:
+                        return val
+            elif isinstance(inner, str) and "<" in inner:
+                return inner
+    return raw_text
+
+
 def get_login_form(session):
-    """GET /Account/Ajax_Login and return (form_html, antiforgery_token)."""
+    """GET /Account/Ajax_Login and return (form_html, antiforgery_token).
+
+    First hits the site root so any anti-forgery / session cookie the login
+    partial depends on is present."""
+    # Prime cookies: some ASP.NET anti-forgery setups only render the login
+    # form's hidden token once a session cookie exists.
+    try:
+        session.get(f"{BASE_URL}/", timeout=30)
+    except requests.RequestException as e:
+        print(f"warning: priming GET / failed: {e}")
+
     r = session.get(f"{BASE_URL}/Account/Ajax_Login",
                     headers={"X-Requested-With": "XMLHttpRequest",
                              "Accept": "application/json, text/html"},
                     timeout=30)
     r.raise_for_status()
 
-    html = r.text
+    payload = None
     try:
         payload = r.json()
-        if isinstance(payload, dict) and "html" in payload:
-            html = payload["html"]
     except ValueError:
         pass  # server returned the form as plain HTML
 
+    html = _pick_form_html(payload, r.text)
+
     soup = BeautifulSoup(html, "html.parser")
+    n_inputs = len(soup.find_all("input"))
+    if n_inputs == 0:
+        # Diagnostics (no credentials are sent on this GET; the login form
+        # is public). Print the response shape so a re-run reveals the real
+        # structure, then let discovery fail loudly.
+        ctype = r.headers.get("Content-Type", "?")
+        shape = (f"keys={sorted(payload.keys())}"
+                 if isinstance(payload, dict) else f"type={type(payload).__name__}")
+        print(f"login form GET: HTTP {r.status_code}, content-type {ctype}, "
+              f"{len(r.text)} bytes, json {shape}")
+        print("response preview: "
+              + redact(r.text[:800], []).replace("\n", " "))
+
     token_input = soup.find("input", attrs={"name": "__RequestVerificationToken"})
     token = token_input.get("value") if token_input else None
+    if not token:
+        # The token may also arrive as a cookie or a JSON field.
+        for k, v in session.cookies.items():
+            if "RequestVerification" in k or "AntiForgery" in k:
+                token = v
+                break
+    if not token and isinstance(payload, dict):
+        for key in ("token", "Token", "antiForgeryToken", "__RequestVerificationToken"):
+            if isinstance(payload.get(key), str):
+                token = payload[key]
+                break
     return html, token
 
 
