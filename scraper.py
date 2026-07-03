@@ -273,25 +273,50 @@ def discover_credential_fields(form_html):
     return user_field, password_field, fields
 
 
-def login(session, email, password):
-    """Full login: fetch form, discover fields, POST /Token, attach bearer."""
-    form_html, token = get_login_form(session)
-    user_field, password_field, fields = discover_credential_fields(form_html)
-    if not user_field or not password_field:
-        # Names and types are not secret; print them so a re-run pinpoints
-        # the real form structure. No credential values are involved here.
-        structure = ", ".join(f"{n}[{t}]" for n, t in fields) or "(no inputs)"
-        fail("could not identify credential fields in the login form "
-             f"(user={user_field!r}, password={'found' if password_field else 'none'}). "
-             f"Form inputs: {structure}")
-    print(f"login form fields: {user_field} / {password_field}"
-          f" (anti-forgery token: {'present' if token else 'MISSING'})")
+def build_token_body(email, password, form_html, token):
+    """Build the POST /Token form body.
 
+    The portal is a JS SPA: unauthenticated routes return the marketing
+    homepage, so the login form is never server-rendered for us to read
+    field names from. The /Token endpoint is an OWIN OAuth token endpoint,
+    which reads the spec-standard lowercase keys `username` and `password`
+    from the form body (via context.UserName / context.Password) regardless
+    of what the on-screen form labels its boxes. We send those, plus a few
+    harmless aliases in case this particular endpoint expects MVC-style
+    names. Extra params are ignored by a conformant token endpoint, so this
+    stays a single login attempt rather than a probing loop."""
     body = {
         "grant_type": "password",
-        user_field: email,
-        password_field: password,
+        "username": email,
+        "password": password,
     }
+
+    # If the form actually was readable (it isn't, currently), honour its
+    # real field names too.
+    user_field, password_field, _ = discover_credential_fields(form_html)
+    if user_field:
+        body[user_field] = email
+    if password_field:
+        body[password_field] = password
+
+    # Common ASP.NET MVC aliases, in case the endpoint is custom.
+    for alias in ("UserName", "Email"):
+        body.setdefault(alias, email)
+    body.setdefault("Password", password)
+
+    if token:
+        body["__RequestVerificationToken"] = token
+    return body
+
+
+def login(session, email, password):
+    """Log in via the OAuth /Token endpoint and attach the bearer token.
+
+    Best-effort: collect cookies and any anti-forgery token first (harmless
+    if absent), then make a single POST /Token."""
+    form_html, token = get_login_form(session)
+
+    body = build_token_body(email, password, form_html, token)
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "X-Requested-With": "XMLHttpRequest",
@@ -299,7 +324,7 @@ def login(session, email, password):
     }
     if token:
         headers["__RequestVerificationToken"] = token
-        body["__RequestVerificationToken"] = token
+    print(f"POST /Token (anti-forgery token: {'present' if token else 'none'})")
 
     r = session.post(f"{BASE_URL}/Token", data=body, headers=headers, timeout=30)
 
@@ -311,7 +336,9 @@ def login(session, email, password):
 
     if r.status_code != 200 or not isinstance(payload, dict) \
             or "access_token" not in payload:
-        print(f"login failed: HTTP {r.status_code}", file=sys.stderr)
+        print(f"login failed: HTTP {r.status_code} "
+              f"(content-type {r.headers.get('Content-Type', '?')})",
+              file=sys.stderr)
         print(redact(r.text[:2000], [email, password]), file=sys.stderr)
         sys.exit(1)
 
