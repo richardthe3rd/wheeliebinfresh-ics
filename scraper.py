@@ -160,44 +160,73 @@ def get_login_form(session):
     return html, token
 
 
+# Input types that can never be the username box.
+_NON_USER_TYPES = {
+    "password", "hidden", "checkbox", "radio", "submit",
+    "button", "image", "reset", "file",
+}
+
+
 def discover_credential_fields(form_html):
     """Read the login form markup to find the username and password field
-    names rather than assuming them."""
+    names rather than assuming them. Returns (user_field, password_field,
+    fields) where fields is a list of (name, type) for diagnostics."""
     soup = BeautifulSoup(form_html, "html.parser")
     inputs = soup.find_all("input")
 
-    password_field = None
-    user_field = None
+    fields = []
     for inp in inputs:
         name = inp.get("name")
-        if not name or name == "__RequestVerificationToken":
-            continue
-        itype = (inp.get("type") or "text").lower()
-        if itype == "password" and not password_field:
+        if name:
+            fields.append((name, (inp.get("type") or "text").lower()))
+
+    password_field = None
+    for name, itype in fields:
+        if itype == "password":
             password_field = name
-        elif itype in ("text", "email") and not user_field:
+            break
+
+    # Username: prefer an input whose name/type hints at it; otherwise take
+    # the first input that isn't the token, the password, or a control type.
+    # This deliberately accepts text, email, tel, search, etc. rather than
+    # whitelisting a couple of types, so an unexpected input type on the
+    # username box doesn't break login.
+    candidates = [
+        name for name, itype in fields
+        if name != "__RequestVerificationToken"
+        and name != password_field
+        and itype not in _NON_USER_TYPES
+    ]
+    user_field = None
+    for name in candidates:
+        low = name.lower()
+        if any(h in low for h in ("user", "email", "login", "name")):
             user_field = name
+            break
+    if not user_field and candidates:
+        user_field = candidates[0]
 
-    # Heuristic fallback if types weren't as expected
-    if not user_field or not password_field:
-        names = [i.get("name") for i in inputs if i.get("name")]
-        for n in names:
-            low = n.lower()
-            if not password_field and "password" in low:
-                password_field = n
-            if not user_field and ("user" in low or "email" in low):
-                user_field = n
+    # Last-ditch: match on name text even for control-typed inputs.
+    if not password_field:
+        for name, _ in fields:
+            if "password" in name.lower() or "pass" == name.lower():
+                password_field = name
+                break
 
-    return user_field, password_field
+    return user_field, password_field, fields
 
 
 def login(session, email, password):
     """Full login: fetch form, discover fields, POST /Token, attach bearer."""
     form_html, token = get_login_form(session)
-    user_field, password_field = discover_credential_fields(form_html)
+    user_field, password_field, fields = discover_credential_fields(form_html)
     if not user_field or not password_field:
+        # Names and types are not secret; print them so a re-run pinpoints
+        # the real form structure. No credential values are involved here.
+        structure = ", ".join(f"{n}[{t}]" for n, t in fields) or "(no inputs)"
         fail("could not identify credential fields in the login form "
-             f"(found user={user_field!r}, password={'yes' if password_field else 'no'})")
+             f"(user={user_field!r}, password={'found' if password_field else 'none'}). "
+             f"Form inputs: {structure}")
     print(f"login form fields: {user_field} / {password_field}"
           f" (anti-forgery token: {'present' if token else 'MISSING'})")
 
