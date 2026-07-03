@@ -36,15 +36,14 @@ clean public URL.
 ### 1. Add the portal credentials as secrets
 
 Repo → **Settings** → **Secrets and variables** → **Actions** →
-**New repository secret**, three times:
+**New repository secret**, twice:
 
 - `WFB_EMAIL` — the email you log into the portal with.
 - `WFB_PASSWORD` — your portal password.
-- `WFB_BOOKING_ID` — your booking number (the digits after `bookingId` on
-  the portal summary page, e.g. as seen in the page source). Kept as a
-  secret so it never appears in the public calendar; only a one-way hash of
-  it is used in event IDs. Optional for local runs — if unset, the scraper
-  reads it from the account page instead.
+
+(Your booking number isn't a secret: it's read from your authenticated
+account page and only ever leaves the program as a one-way hash in the
+event IDs, so the raw number never appears in the public calendar.)
 
 ### 2. Turn on GitHub Pages (source: GitHub Actions)
 

@@ -334,18 +334,6 @@ def parse_booking_id(page_html):
     return int(m.group(1)) if m else None
 
 
-def resolve_booking_id(page_html):
-    """The booking id used to request the schedule. Prefer the WFB_BOOKING_ID
-    secret (so the raw number never has to be derived from public output);
-    fall back to parsing it from the account page for local runs."""
-    env = (os.environ.get("WFB_BOOKING_ID") or "").strip()
-    if env:
-        if not env.isdigit():
-            fail("WFB_BOOKING_ID must be numeric")
-        return int(env)
-    return parse_booking_id(page_html)
-
-
 def uid_slug(booking_id):
     """A stable, non-reversible token for event UIDs. Keeps the raw booking
     id out of the published (public) calendar while staying constant across
@@ -571,11 +559,12 @@ def main():
     login(session, email, password)
 
     page = get_account_page(session)
-    booking_id = resolve_booking_id(page)
+    booking_id = parse_booking_id(page)
     if not booking_id:
-        fail("no booking id: set the WFB_BOOKING_ID secret, or the account "
+        fail("could not find bookingId on the account page; "
              "page layout may have changed")
-    # Don't log the raw id (it's treated as private); log the public slug.
+    # Log the public UID slug, not the raw id (the id only ever leaves the
+    # program as this one-way hash).
     print(f"booking resolved (uid slug {uid_slug(booking_id)})")
 
     debug = bool(os.environ.get("WFB_DEBUG"))
