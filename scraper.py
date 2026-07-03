@@ -138,127 +138,122 @@ def extract_dates(html, today):
 # Portal client
 # --------------------------------------------------------------------------
 
-def prime_session(session):
-    """Hit the site root to collect cookies and return any anti-forgery
-    token found in the cookie jar.
+def fetch_login_form(session):
+    """Fetch the `_Login` partial and return its HTML.
 
-    The portal is a JavaScript SPA: unauthenticated routes (including the
-    old /Account/Ajax_Login partial, which now 302s to a NotFound page)
-    just return the marketing homepage, so there is no server-rendered login
-    form to read field names from. All we need here is the cookie jar."""
+    The portal is a JS SPA. The login form is a server-rendered partial the
+    app pulls in via POST /Account/Ajax_Login (a plain GET 302s to a
+    NotFound page). This POST also sets the ASP.NET session and anti-forgery
+    cookies that the subsequent /Token call depends on, so it must run in
+    the same requests.Session."""
+    r = session.post(f"{BASE_URL}/Account/Ajax_Login",
+                     data={"partial": "_Login", "formId": "Login"},
+                     headers={"X-Requested-With": "XMLHttpRequest",
+                              "Accept": "application/json"},
+                     timeout=30)
+    r.raise_for_status()
+
+    html = None
     try:
-        session.get(f"{BASE_URL}/", timeout=30)
-    except requests.RequestException as e:
-        print(f"warning: priming GET / failed: {e}")
-
-    for k, v in session.cookies.items():
-        if "RequestVerification" in k or "AntiForgery" in k:
-            return v
-    return None
-
-
-# Input types that can never be the username box.
-_NON_USER_TYPES = {
-    "password", "hidden", "checkbox", "radio", "submit",
-    "button", "image", "reset", "file",
-}
+        payload = r.json()
+        if isinstance(payload, dict):
+            for key in ("html", "Html", "view", "partial", "data"):
+                if isinstance(payload.get(key), str):
+                    html = payload[key]
+                    break
+    except ValueError:
+        pass
+    if html is None:
+        html = r.text
+    return html
 
 
-def discover_credential_fields(form_html):
-    """Read the login form markup to find the username and password field
-    names rather than assuming them. Returns (user_field, password_field,
-    fields) where fields is a list of (name, type) for diagnostics."""
-    soup = BeautifulSoup(form_html, "html.parser")
-    inputs = soup.find_all("input")
+def parse_login_form(html):
+    """Parse the login partial into (fields, user_field, password_field, rvt).
 
-    fields = []
-    for inp in inputs:
+    `fields` maps every input name to the value we should submit, defaults
+    preserved verbatim. This is what makes login work: the form carries an
+    anti-forgery token plus an anti-bot honeypot (a text input that must be
+    submitted empty and an encrypted `__htpKey`); the server validates all
+    of them and returns a generic `invalid_grant` if any is missing, even
+    with correct credentials. Preserving every field's default value keeps
+    the honeypot empty and the key intact; we only overwrite the credential
+    fields. `user_field`/`password_field` are located by input type (email /
+    password), not by a hard-coded name."""
+    soup = BeautifulSoup(html, "html.parser")
+    fields = {}
+    user_field = password_field = rvt = None
+
+    for inp in soup.find_all("input"):
         name = inp.get("name")
-        if name:
-            fields.append((name, (inp.get("type") or "text").lower()))
+        if not name:
+            continue
+        itype = (inp.get("type") or "text").lower()
+        value = inp.get("value") or ""
+        classes = " ".join(inp.get("class") or [])
 
-    password_field = None
-    for name, itype in fields:
-        if itype == "password":
+        if itype == "submit" or itype == "button":
+            continue
+        if name == "__RequestVerificationToken":
+            rvt = value
+        if itype == "password" and not password_field:
             password_field = name
-            break
-
-    # Username: prefer an input whose name/type hints at it; otherwise take
-    # the first input that isn't the token, the password, or a control type.
-    # This deliberately accepts text, email, tel, search, etc. rather than
-    # whitelisting a couple of types, so an unexpected input type on the
-    # username box doesn't break login.
-    candidates = [
-        name for name, itype in fields
-        if name != "__RequestVerificationToken"
-        and name != password_field
-        and itype not in _NON_USER_TYPES
-    ]
-    user_field = None
-    for name in candidates:
-        low = name.lower()
-        if any(h in low for h in ("user", "email", "login", "name")):
+        elif itype == "email" and not user_field:
             user_field = name
-            break
-    if not user_field and candidates:
-        user_field = candidates[0]
 
-    # Last-ditch: match on name text even for control-typed inputs.
-    if not password_field:
-        for name, _ in fields:
-            if "password" in name.lower() or "pass" == name.lower():
-                password_field = name
+        if itype in ("checkbox", "radio"):
+            # Replicate an unchecked box: omit it (matches the SPA default).
+            if not inp.has_attr("checked"):
+                continue
+            value = value or "true"
+        # Preserve the field verbatim (honeypot stays empty, keys intact).
+        fields[name] = value
+
+    # Fallback if the email input wasn't type=email: first text field that
+    # isn't the honeypot (class wfb-htp) or a framework hidden field.
+    if not user_field:
+        for inp in soup.find_all("input"):
+            name = inp.get("name")
+            itype = (inp.get("type") or "text").lower()
+            classes = " ".join(inp.get("class") or [])
+            if (itype in ("text", "email") and name
+                    and "wfb-htp" not in classes
+                    and not name.startswith("__")):
+                user_field = name
                 break
 
-    return user_field, password_field, fields
-
-
-def build_token_body(email, password, token):
-    """Build the POST /Token form body.
-
-    /Token is an OWIN OAuth token endpoint. With grant_type=password the
-    middleware reads the spec-standard lowercase keys `username`/`password`
-    (into context.UserName / context.Password) regardless of what the
-    on-screen SPA labels its boxes. We send those plus a few harmless
-    aliases (email / MVC-style names) in case the provider reads the form
-    directly. A conformant token endpoint ignores unknown params, so this
-    stays a single login attempt rather than a probing loop.
-
-    Confirmed live: this shape is accepted (a wrong password yields a clean
-    `invalid_grant` "The user name or password is incorrect." rather than an
-    `invalid_request`/`unsupported_grant_type` error)."""
-    body = {
-        "grant_type": "password",
-        "username": email,
-        "password": password,
-    }
-    # Aliases in case the provider reads the raw form for a differently
-    # named identifier field.
-    for alias in ("email", "Email", "UserName"):
-        body.setdefault(alias, email)
-    body.setdefault("Password", password)
-
-    if token:
-        body["__RequestVerificationToken"] = token
-    return body
+    return fields, user_field, password_field, rvt
 
 
 def login(session, email, password):
-    """Log in via the OAuth /Token endpoint and attach the bearer token.
+    """Log in by replicating the SPA's login-form submission to /Token.
 
-    Best-effort: collect cookies and any anti-forgery token first (harmless
-    if absent), then make a single POST /Token."""
-    token = prime_session(session)
+    Fetch the login partial (which sets the session/anti-forgery cookies and
+    carries the honeypot fields), fill in the credentials, and POST the whole
+    form to /Token with grant_type=password and the anti-forgery header."""
+    html = fetch_login_form(session)
+    fields, user_field, password_field, rvt = parse_login_form(html)
+    if not user_field or not password_field:
+        names = ", ".join(sorted(fields)) or "(none)"
+        fail("could not locate the username/password inputs in the login "
+             f"form (user={user_field!r}, password={password_field!r}). "
+             f"Form fields: {names}")
 
-    body = build_token_body(email, password, token)
+    body = dict(fields)                 # honeypot (empty), __htpKey, RVT, ...
+    body[user_field] = email
+    body[password_field] = password
+    body["grant_type"] = "password"
+
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json",
     }
-    if token:
-        headers["__RequestVerificationToken"] = token
-    print(f"POST /Token (anti-forgery token: {'present' if token else 'none'})")
+    if rvt:
+        headers["__RequestVerificationToken"] = rvt
+    print(f"POST /Token as {user_field}/{password_field} "
+          f"(anti-forgery token: {'present' if rvt else 'MISSING'}, "
+          f"{len(fields)} form fields)")
 
     r = session.post(f"{BASE_URL}/Token", data=body, headers=headers, timeout=30)
 
@@ -277,8 +272,8 @@ def login(session, email, password):
         sys.exit(1)
 
     session.headers["Authorization"] = f"Bearer {payload['access_token']}"
-    if token:
-        session.headers["__RequestVerificationToken"] = token
+    if rvt:
+        session.headers["__RequestVerificationToken"] = rvt
     print("login OK")
 
 
