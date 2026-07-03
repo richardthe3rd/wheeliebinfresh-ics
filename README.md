@@ -36,10 +36,15 @@ clean public URL.
 ### 1. Add the portal credentials as secrets
 
 Repo → **Settings** → **Secrets and variables** → **Actions** →
-**New repository secret**, twice:
+**New repository secret**, three times:
 
 - `WFB_EMAIL` — the email you log into the portal with.
 - `WFB_PASSWORD` — your portal password.
+- `WFB_BOOKING_ID` — your booking number (the digits after `bookingId` on
+  the portal summary page, e.g. as seen in the page source). Kept as a
+  secret so it never appears in the public calendar; only a one-way hash of
+  it is used in event IDs. Optional for local runs — if unset, the scraper
+  reads it from the account page instead.
 
 ### 2. Turn on GitHub Pages (source: GitHub Actions)
 
@@ -101,8 +106,9 @@ python scraper.py            # writes ./bin-clean.ics
   and is **not** a clean date; only the "Bin Cleans" columns are. The
   scraper skips the W/C column and de-duplicates, so you get exactly the
   real Friday cleans (regular + ad-hoc).
-- Events use stable UIDs (`wfb-<bookingId>-<date>@binclean`), so re-runs
-  update rather than duplicate.
+- Events use stable UIDs (`wfb-<hash>-<date>@binclean`, where `<hash>` is a
+  one-way hash of the booking id — the raw number never appears in the
+  published file), so re-runs update rather than duplicate.
 - The scraper refuses to write the file on missing/implausible dates, and
   the workflow refuses to deploy an empty file — a portal change fails the
   run loudly instead of publishing a broken calendar.

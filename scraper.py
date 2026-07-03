@@ -7,7 +7,7 @@ login/parse failure so a scheduled run fails loudly rather than
 publishing bad data.
 """
 
-import json
+import hashlib
 import os
 import re
 import sys
@@ -334,6 +334,25 @@ def parse_booking_id(page_html):
     return int(m.group(1)) if m else None
 
 
+def resolve_booking_id(page_html):
+    """The booking id used to request the schedule. Prefer the WFB_BOOKING_ID
+    secret (so the raw number never has to be derived from public output);
+    fall back to parsing it from the account page for local runs."""
+    env = (os.environ.get("WFB_BOOKING_ID") or "").strip()
+    if env:
+        if not env.isdigit():
+            fail("WFB_BOOKING_ID must be numeric")
+        return int(env)
+    return parse_booking_id(page_html)
+
+
+def uid_slug(booking_id):
+    """A stable, non-reversible token for event UIDs. Keeps the raw booking
+    id out of the published (public) calendar while staying constant across
+    runs so re-runs update events instead of duplicating them."""
+    return hashlib.sha256(f"wfb:{booking_id}".encode()).hexdigest()[:16]
+
+
 def find_table_column(table, header_text):
     """Return the 0-based index of the column whose header contains
     header_text (case-insensitive), or None."""
@@ -501,6 +520,7 @@ def ics_escape(text):
 
 
 def build_ics(dates, booking_id):
+    slug = uid_slug(booking_id)
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -514,7 +534,7 @@ def build_ics(dates, booking_id):
         next_day = (d + timedelta(days=1)).strftime("%Y%m%d")
         lines.extend([
             "BEGIN:VEVENT",
-            f"UID:wfb-{booking_id}-{ymd}@binclean",
+            f"UID:wfb-{slug}-{ymd}@binclean",
             # Deliberately derived from the event date, not "now", so the
             # file is byte-identical across runs unless the schedule changes.
             f"DTSTAMP:{ymd}T000000Z",
@@ -551,11 +571,12 @@ def main():
     login(session, email, password)
 
     page = get_account_page(session)
-    booking_id = parse_booking_id(page)
+    booking_id = resolve_booking_id(page)
     if not booking_id:
-        fail("could not find bookingId on the account page; "
+        fail("no booking id: set the WFB_BOOKING_ID secret, or the account "
              "page layout may have changed")
-    print(f"bookingId: {booking_id}")
+    # Don't log the raw id (it's treated as private); log the public slug.
+    print(f"booking resolved (uid slug {uid_slug(booking_id)})")
 
     debug = bool(os.environ.get("WFB_DEBUG"))
     # Address is only collected to redact it from any debug output.

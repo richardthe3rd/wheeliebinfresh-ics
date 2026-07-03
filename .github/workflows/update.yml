@@ -42,6 +42,7 @@ jobs:
         env:
           WFB_EMAIL: ${{ secrets.WFB_EMAIL }}
           WFB_PASSWORD: ${{ secrets.WFB_PASSWORD }}
+          WFB_BOOKING_ID: ${{ secrets.WFB_BOOKING_ID }}
           WFB_DEBUG: ${{ inputs.debug && '1' || '' }}
         run: python scraper.py
 
